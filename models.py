@@ -118,6 +118,7 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
+    username = Column(String(100), unique=True, index=True, nullable=True)
     email = Column(String(255), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255), nullable=False)
@@ -173,6 +174,7 @@ class RegistrationRequest(Base):
     full_name = Column(String(255), nullable=False)
     email = Column(String(255), nullable=False, index=True)
     phone = Column(String(50), nullable=False)
+    telegram_chat_id = Column(String(100), nullable=True)
     farm_name = Column(String(255), nullable=False)
     farm_location = Column(String(255), nullable=False)
     farm_area_hectares = Column(Float, nullable=True)

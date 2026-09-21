@@ -1,6 +1,7 @@
 import json
 import logging
 import asyncio
+from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 from core.config import settings
 from core.websocket_manager import ws_manager
@@ -11,6 +12,7 @@ class BackendMQTTBridge:
     def __init__(self):
         self.client = mqtt.Client(client_id="AgriTechBackendAPI")
         self.latest_telemetry = {}
+        self.latest_telemetry_received_at = {}
         self.loop = None
 
     def start(self, event_loop):
@@ -28,6 +30,7 @@ class BackendMQTTBridge:
                 rover_id = payload.get("rover_id")
                 data = payload.get("data", {})
                 self.latest_telemetry[rover_id] = data
+                self.latest_telemetry_received_at[rover_id] = datetime.now(timezone.utc)
                 
                 if self.loop and self.loop.is_running():
                     asyncio.run_coroutine_threadsafe(
@@ -52,6 +55,9 @@ class BackendMQTTBridge:
             logger.warning(f"Backend MQTT Bridge connect failed ({e}). Running with in-memory telemetry pool.")
 
     def dispatch_command(self, rover_id: str, command: str, params: dict = None):
+        if not self.client.is_connected():
+            logger.warning("Cannot dispatch command; MQTT broker is disconnected")
+            return False
         topic = f"{settings.MQTT_TOPIC_PREFIX}/{rover_id}/command"
         payload = json.dumps({
             "command": command.upper(),

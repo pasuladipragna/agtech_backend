@@ -22,7 +22,7 @@ class EmailProvider(ABC):
 
 class SMSProvider(ABC):
     @abstractmethod
-    def send(self, to_phone: str, message: str) -> bool:
+    def send(self, to_phone: str, message: str, telegram_chat_id: Optional[str] = None) -> bool:
         pass
 
 
@@ -71,6 +71,67 @@ class SMTPEmailProvider(EmailProvider):
             return False
 
 
+# ── Fast2SMS Provider (Indian SMS Gateway) ──────────────────────
+
+class Fast2SMSSMSProvider(SMSProvider):
+    def __init__(self):
+        self.api_key = os.getenv("SMS_FAST2SMS_API_KEY", "")
+        self.route = os.getenv("SMS_FAST2SMS_ROUTE", "q")  # 'q' for quick transaction/OTP or 'dlt'
+
+    def send(self, to_phone: str, message: str, telegram_chat_id: Optional[str] = None) -> bool:
+        if not self.api_key:
+            logger.warning("[SMS] Fast2SMS not configured — SMS not sent to %s", to_phone)
+            return False
+
+        try:
+            import requests
+            clean_phone = "".join(filter(str.isdigit, to_phone or ""))
+            if clean_phone.startswith("91") and len(clean_phone) == 12:
+                clean_phone = clean_phone[2:]
+            if len(clean_phone) != 10 or not clean_phone.isdigit():
+                logger.error("[SMS Fast2SMS] Invalid Indian phone number: %s", to_phone)
+                return False
+
+            url = "https://www.fast2sms.com/dev/bulkV2"
+            payload = {
+                "route": self.route,
+                "message": message,
+                "language": "english",
+                "flash": 0,
+                "numbers": clean_phone
+            }
+            headers = {
+                'authorization': self.api_key,
+                'Content-Type': "application/x-www-form-urlencoded",
+                'Cache-Control': "no-cache"
+            }
+
+            response = requests.post(url, data=payload, headers=headers, timeout=10)
+            try:
+                res_data = response.json()
+            except ValueError:
+                logger.error(
+                    "[SMS Fast2SMS] Non-JSON response (HTTP %s): %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+                return False
+
+            if response.ok and res_data.get("return") is True:
+                logger.info("[SMS Fast2SMS] Sent successfully to %s", to_phone)
+                return True
+                
+            logger.error(
+                "[SMS Fast2SMS] Failed response (HTTP %s): %s",
+                response.status_code,
+                res_data,
+            )
+            return False
+        except Exception as e:
+            logger.error("[SMS Fast2SMS] Exception sending to %s: %s", to_phone, str(e))
+            return False
+
+
 # ── Twilio SMS Provider ────────────────────────────────────────
 
 class TwilioSMSProvider(SMSProvider):
@@ -79,7 +140,7 @@ class TwilioSMSProvider(SMSProvider):
         self.auth_token = os.getenv("SMS_TWILIO_AUTH_TOKEN", "")
         self.from_phone = os.getenv("SMS_FROM_PHONE", "")
 
-    def send(self, to_phone: str, message: str) -> bool:
+    def send(self, to_phone: str, message: str, telegram_chat_id: Optional[str] = None) -> bool:
         if not self.account_sid or not self.auth_token or not self.from_phone:
             logger.warning("[SMS] Twilio not configured — SMS not sent to %s", to_phone)
             return False
@@ -92,6 +153,45 @@ class TwilioSMSProvider(SMSProvider):
             return True
         except Exception as e:
             logger.error("[SMS] Failed to send to %s: %s", to_phone, str(e))
+            return False
+
+
+class TelegramSMSProvider(SMSProvider):
+    """Simple Telegram bot fallback for activation delivery when SMS gateways are unavailable."""
+
+    def __init__(self):
+        self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    def send(self, to_phone: str, message: str, telegram_chat_id: Optional[str] = None) -> bool:
+        chat_id = telegram_chat_id or self.chat_id
+        if not self.bot_token or not chat_id:
+            logger.warning("[SMS] Telegram not configured — SMS not sent to %s", to_phone)
+            return False
+
+        try:
+            import requests
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+            }
+            response = requests.post(url, data=payload, timeout=10)
+            try:
+                data = response.json()
+            except ValueError:
+                logger.error("[SMS Telegram] Non-JSON response: %s", response.text[:500])
+                return False
+
+            if response.ok and data.get("ok") is True:
+                logger.info("[SMS Telegram] Sent successfully to %s", to_phone)
+                return True
+
+            logger.error("[SMS Telegram] Failed response (HTTP %s): %s", response.status_code, data)
+            return False
+        except Exception as e:
+            logger.error("[SMS Telegram] Exception sending to %s: %s", to_phone, str(e))
             return False
 
 
@@ -110,8 +210,25 @@ class ConsoleEmailProvider(EmailProvider):
 
 class ConsoleSMSProvider(SMSProvider):
     """Development only — prints SMS to console."""
-    def send(self, to_phone: str, message: str) -> bool:
+    def send(self, to_phone: str, message: str, telegram_chat_id: Optional[str] = None) -> bool:
         logger.info("[DEV SMS - NOT SENT]\n  To: %s\n  Message: %s", to_phone, message)
+        return False
+
+
+class FallbackSMSProvider(SMSProvider):
+    """Try configured SMS providers in order until one delivers the message."""
+
+    def __init__(self, providers: list[SMSProvider]):
+        self.providers = providers
+
+    def send(self, to_phone: str, message: str, telegram_chat_id: Optional[str] = None) -> bool:
+        for provider in self.providers:
+            if provider.send(to_phone, message, telegram_chat_id):
+                return True
+            logger.warning(
+                "[SMS] Provider %s failed; trying the next provider",
+                provider.__class__.__name__,
+            )
         return False
 
 
@@ -130,6 +247,7 @@ class CommunicationService:
     def send_activation_email(
         self,
         to_email: str,
+        username: str,
         full_name: str,
         temp_password: str,
         activation_token: str,
@@ -146,10 +264,8 @@ Your registration has been approved! Your Smart AgriTech Rover account is now ac
 
 Login Details:
   Website: {login_url}
-  Email: {to_email}
-  Temporary Password: {temp_password}
-
-IMPORTANT: You will be asked to create a new password when you log in for the first time.
+  Username: {username}
+  Password: {temp_password}
 
 If you have any questions, please contact our support team.
 
@@ -166,10 +282,9 @@ Smart AgriTech Rover Platform
     <p>Your registration has been approved! Your Smart AgriTech Rover account is now active.</p>
     <div style="background: #f0f7f0; border: 1px solid #b9dcbb; border-radius: 6px; padding: 16px; margin: 20px 0;">
       <p style="margin: 0 0 8px 0; font-weight: bold; color: #2f7035;">Your Login Details:</p>
-      <p style="margin: 4px 0;">📧 Email: <strong>{to_email}</strong></p>
-      <p style="margin: 4px 0;">🔑 Temporary Password: <strong style="font-family: monospace; font-size: 16px;">{temp_password}</strong></p>
+      <p style="margin: 4px 0;">👤 Username: <strong>{username}</strong></p>
+      <p style="margin: 4px 0;">🔑 Password: <strong style="font-family: monospace; font-size: 16px;">{temp_password}</strong></p>
     </div>
-    <p style="color: #c4521f;"><strong>⚠️ Important:</strong> You will be asked to create a new password when you log in for the first time.</p>
     <div style="text-align: center; margin: 28px 0;">
       <a href="{login_url}" style="background: #3d8c42; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 15px;">Go to Login Page</a>
     </div>
@@ -182,17 +297,19 @@ Smart AgriTech Rover Platform
     def send_activation_sms(
         self,
         to_phone: str,
+        username: str,
         full_name: str,
         temp_password: str,
+        telegram_chat_id: Optional[str] = None,
     ) -> bool:
         """Send farmer account activation SMS."""
         app_url = os.getenv("NEXT_PUBLIC_APP_URL", "http://localhost:3000")
         message = (
             f"Smart AgriTech: Hello {full_name}! Your account is approved. "
-            f"Login at {app_url}/login — Email: your registered email, "
-            f"Temp Password: {temp_password}. Change your password after first login."
+            f"Login at {app_url}/login — Username: {username}, "
+            f"Password: {temp_password}"
         )
-        return self.sms.send(to_phone, message)
+        return self.sms.send(to_phone, message, telegram_chat_id)
 
     def send_notification_email(
         self, to_email: str, subject: str, body: str
@@ -209,20 +326,31 @@ def create_communication_service() -> CommunicationService:
     """
     Create the communication service with appropriate providers.
     In development (no SMTP config), uses console providers that log but don't send.
-    In production, uses real SMTP + Twilio.
+    In production, uses real SMTP + Fast2SMS / Twilio.
     """
     env = os.getenv("ENV", "development")
 
     smtp_configured = bool(os.getenv("EMAIL_SMTP_HOST"))
-    sms_configured = bool(os.getenv("SMS_TWILIO_ACCOUNT_SID"))
+    fast2sms_configured = bool(os.getenv("SMS_FAST2SMS_API_KEY"))
+    twilio_configured = bool(os.getenv("SMS_TWILIO_ACCOUNT_SID"))
+    telegram_configured = bool(os.getenv("TELEGRAM_BOT_TOKEN")) and bool(os.getenv("TELEGRAM_CHAT_ID"))
 
     email_provider = SMTPEmailProvider() if smtp_configured else ConsoleEmailProvider()
-    sms_provider = TwilioSMSProvider() if sms_configured else ConsoleSMSProvider()
+
+    sms_providers = []
+    if fast2sms_configured:
+        sms_providers.append(Fast2SMSSMSProvider())
+    if twilio_configured:
+        sms_providers.append(TwilioSMSProvider())
+    if telegram_configured:
+        sms_providers.append(TelegramSMSProvider())
+    sms_providers.append(ConsoleSMSProvider())
+    sms_provider = FallbackSMSProvider(sms_providers)
 
     if env == "development":
         if not smtp_configured:
             logger.info("[Communication] No SMTP config — using console email (dev mode)")
-        if not sms_configured:
+        if not (fast2sms_configured or twilio_configured or telegram_configured):
             logger.info("[Communication] No SMS config — using console SMS (dev mode)")
 
     return CommunicationService(email_provider, sms_provider)

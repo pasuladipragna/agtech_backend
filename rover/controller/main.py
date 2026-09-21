@@ -3,7 +3,6 @@ import logging
 from rover.config.rover_config import settings
 from rover.hardware.hal import RoverHAL
 from rover.navigation.autonomous_driver import AutonomousDriver
-from rover.camera.streamer import CameraStreamer
 from rover.communication.mqtt_client import RoverMQTTClient
 
 logging.basicConfig(
@@ -17,7 +16,6 @@ class RoverControllerApp:
         logger.info(f"Initializing Rover Controller for {settings.rover_id}...")
         self.hal = RoverHAL()
         self.navigator = AutonomousDriver(self.hal)
-        self.streamer = CameraStreamer()
         self.mqtt = RoverMQTTClient(
             broker=settings.mqtt_broker,
             port=settings.mqtt_port,
@@ -59,7 +57,6 @@ class RoverControllerApp:
                 
                 if current_time - last_telemetry_time >= 1.0:
                     sensor_data["nav_status"] = nav_status
-                    sensor_data["frame_data"] = self.streamer.generate_simulated_frame(sensor_data)
                     self.mqtt.publish_telemetry(sensor_data)
                     last_telemetry_time = current_time
 

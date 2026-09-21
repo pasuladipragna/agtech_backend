@@ -82,25 +82,24 @@ def get_client_ip(request: Request) -> str:
 # ============================================================
 
 @api_router.post("/auth/login")
-def farmer_login(
+def login(
     payload: dict,
     request: Request,
     db: Session = Depends(get_db)
 ):
     """
-    Farmer login endpoint.
-    Returns status message if account is not approved.
-    Only fully approved accounts with active users can log in.
+    Unified login endpoint for both Admin and Farmer.
+    Role is determined by the backend. No role selection by the user.
     """
     email = (payload.get("email") or "").strip().lower()
     password = payload.get("password") or ""
 
     if not email or not password:
-        raise HTTPException(status_code=422, detail="Email and password are required.")
+        raise HTTPException(status_code=422, detail="Username/Email and password are required.")
 
-    user = db.query(User).filter(User.email == email, User.is_active == True).first()
+    user = db.query(User).filter(((User.email == email) | (User.username == email)), User.is_active == True).first()
 
-    # Check registration request status if user doesn't exist yet
+    # If user not found, check if there's a pending farmer registration
     if not user:
         reg = db.query(RegistrationRequest).filter(
             RegistrationRequest.email == email
@@ -156,53 +155,6 @@ def farmer_login(
             "full_name": user.full_name,
             "role": user.role,
             "must_change_password": user.must_change_password,
-        }
-    }
-
-
-@api_router.post("/auth/admin/login")
-def admin_login(
-    payload: dict,
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    """Admin-only login. Separate endpoint for security."""
-    email = (payload.get("email") or "").strip().lower()
-    password = payload.get("password") or ""
-
-    if not email or not password:
-        raise HTTPException(status_code=422, detail="Email and password are required.")
-
-    user = db.query(User).filter(
-        User.email == email,
-        User.role == UserRole.ADMIN,
-        User.is_active == True
-    ).first()
-
-    if not user or not verify_password(password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Incorrect admin credentials.")
-
-    token = create_access_token(
-        subject=user.email,
-        role=user.role,
-        user_id=user.id,
-    )
-
-    user.last_login_at = datetime.utcnow()
-    db.commit()
-
-    log_activity(db, "ADMIN_LOGIN", actor=user, resource_type="User", resource_id=user.id,
-                 ip_address=get_client_ip(request))
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": {
-            "id": user.id,
-            "email": user.email,
-            "full_name": user.full_name,
-            "role": user.role,
-            "must_change_password": False,
         }
     }
 
@@ -265,6 +217,7 @@ def submit_registration_request(
     full_name: str = Form(...),
     email: str = Form(...),
     phone: str = Form(...),
+    telegram_chat_id: Optional[str] = Form(None),
     farm_name: str = Form(...),
     farm_location: str = Form(...),
     farm_area_hectares: Optional[float] = Form(None),
@@ -306,6 +259,7 @@ def submit_registration_request(
         full_name=full_name.strip(),
         email=email,
         phone=phone.strip(),
+        telegram_chat_id=telegram_chat_id.strip() if telegram_chat_id else None,
         farm_name=farm_name.strip(),
         farm_location=farm_location.strip(),
         farm_area_hectares=farm_area_hectares,
@@ -396,6 +350,8 @@ def update_registration_status(
 
     new_status = payload.get("status")
     rejection_reason = payload.get("rejection_reason")
+    assigned_password = payload.get("assigned_password")
+    assigned_username = payload.get("assigned_username")
 
     valid_statuses = [
         RegistrationStatus.UNDER_REVIEW,
@@ -416,17 +372,18 @@ def update_registration_status(
 
     if new_status == RegistrationStatus.APPROVED:
         # Create farmer account
-        temp_password = generate_temp_password()
+        temp_password = assigned_password or generate_temp_password()
         activation_token = generate_activation_token()
 
         farmer_user = User(
+            username=assigned_username,
             email=reg.email,
             hashed_password=get_password_hash(temp_password),
             full_name=reg.full_name,
             phone=reg.phone,
             role=UserRole.FARMER,
             is_active=True,
-            must_change_password=True,  # Force password change on first login
+            must_change_password=not bool(assigned_password),  # Force change only if auto-generated
             activation_token=activation_token,
             preferred_language=reg.preferred_language,
         )
@@ -474,7 +431,9 @@ def update_registration_status(
             db_session_factory=None,  # Will use new session in task
             reg_id=reg.id,
             email=reg.email,
+            username=assigned_username,
             phone=reg.phone,
+            telegram_chat_id=reg.telegram_chat_id,
             full_name=reg.full_name,
             temp_password=temp_password,
             activation_token=activation_token,
@@ -508,8 +467,9 @@ def update_registration_status(
 
 
 def send_farmer_activation(
-    db_session_factory, reg_id: str, email: str, phone: str,
-    full_name: str, temp_password: str, activation_token: str
+    db_session_factory, reg_id: str, email: str, username: str, phone: str,
+    full_name: str, temp_password: str, activation_token: str,
+    telegram_chat_id: Optional[str] = None
 ):
     """Background task: send email + SMS with activation info."""
     from core.database import SessionLocal
@@ -524,6 +484,7 @@ def send_farmer_activation(
         # Send email
         email_sent = communication_service.send_activation_email(
             to_email=email,
+            username=username or email,
             full_name=full_name,
             temp_password=temp_password,
             activation_token=activation_token,
@@ -533,8 +494,10 @@ def send_farmer_activation(
         # Send SMS
         sms_sent = communication_service.send_activation_sms(
             to_phone=phone,
+            username=username or email,
             full_name=full_name,
             temp_password=temp_password,
+            telegram_chat_id=telegram_chat_id,
         )
         reg.sms_status = "SMS_SENT" if sms_sent else "SMS_FAILED"
 
@@ -551,6 +514,7 @@ def _format_reg_request(reg: RegistrationRequest) -> dict:
         "full_name": reg.full_name,
         "email": reg.email,
         "phone": reg.phone,
+        "telegram_chat_id": reg.telegram_chat_id,
         "farm_name": reg.farm_name,
         "farm_location": reg.farm_location,
         "farm_area_hectares": reg.farm_area_hectares,
@@ -1142,7 +1106,16 @@ def _format_rover(rover: RoverDevice, telemetry: Optional[RoverTelemetry], mqtt_
             return tele_val
         return None  # Data unavailable
 
-    is_connected = bool(mqtt_data)  # Only connected if we have live MQTT data
+    mqtt_received_at = mqtt_bridge.latest_telemetry_received_at.get(rover.rover_id)
+    mqtt_is_fresh = bool(
+        mqtt_received_at and
+        (datetime.now(mqtt_received_at.tzinfo) - mqtt_received_at).total_seconds() <= 15
+    )
+    telemetry_is_fresh = bool(
+        telemetry and
+        (datetime.utcnow() - telemetry.recorded_at).total_seconds() <= 15
+    )
+    is_connected = mqtt_is_fresh or telemetry_is_fresh
 
     return {
         "id": rover.id,
