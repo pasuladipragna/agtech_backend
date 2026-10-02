@@ -27,7 +27,7 @@ from models import (
     User, UserRole, RegistrationRequest, RegistrationStatus,
     FarmerProfile, Farm, Field, Crop, CropStatus,
     RoverDevice, RoverAssignment, RoverCommand, RoverTelemetry, RoverTask,
-    CommandStatus, RoverStatus,
+    CommandStatus, RoverStatus, RoverMode,
     CropHealthRecord, DetectionEvidence, VideoAnalysisJob, VideoJobStatus,
     Product, SpraySession, SprayEvent, SprayStatus,
     WeatherRecord, Notification, NotificationType,
@@ -40,6 +40,28 @@ from media.service import media_service
 from iot.mqtt import mqtt_bridge
 
 api_router = APIRouter()
+
+
+def _print_crop_analysis_result(result, field_id: str, filename: str, image_size_bytes: int) -> None:
+    """Write the complete non-sensitive crop decision and metrics to the API terminal."""
+    status = "DISEASE_DETECTED" if not result.is_healthy else "NO_DISEASE_DETECTED"
+    reason = (
+        f"{result.label}; plant_present={result.plant_present}"
+        if result.is_healthy
+        else "Model classified the crop as unhealthy"
+    )
+    description = (result.description or "").replace("\n", " ").strip()
+    print(
+        "[DISEASE DETECTION] "
+        f"status={status} field_id={field_id} filename={filename} "
+        f"reason={reason} label={result.label} category={result.category} "
+        f"confidence={result.confidence:.4f} confidence_pct={result.confidence * 100:.2f}% "
+        f"severity={result.severity} plant_present={result.plant_present} "
+        f"image_size_bytes={image_size_bytes} "
+        f"recommended_spray_l_per_ha={result.recommended_spray_volume_l_per_ha:.3f} "
+        f"treatment={result.recommended_treatment} description={description}",
+        flush=True,
+    )
 
 
 # ============================================================
@@ -58,9 +80,9 @@ def log_activity(
 ):
     """Create an activity log entry."""
     log = ActivityLog(
-        actor_id=actor.id if actor else None,
-        actor_email=actor.email if actor else None,
-        actor_role=actor.role if actor else None,
+        actor_id=getattr(actor, "id", None) if actor else None,
+        actor_email=getattr(actor, "email", None) if actor else None,
+        actor_role=getattr(actor, "role", None) if actor else None,
         action=action,
         resource_type=resource_type,
         resource_id=resource_id,
@@ -73,8 +95,16 @@ def log_activity(
 
 
 def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For")
-    return forwarded.split(",")[0].strip() if forwarded else request.client.host
+    headers = getattr(request, "headers", {}) or {}
+    forwarded = headers.get("X-Forwarded-For") if hasattr(headers, "get") else None
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+
+    client = getattr(request, "client", None)
+    if client and getattr(client, "host", None):
+        return client.host
+
+    return "unknown"
 
 
 # ============================================================
@@ -980,6 +1010,8 @@ def send_rover_command(
     """
     Send a command to the rover.
     Full safety pipeline: auth → authorization → validation → safety → dispatch → log.
+    Supports both the legacy command names already used in the app and the required
+    movement names: FORWARD/BACKWARD/LEFT/RIGHT/STOP.
     """
     rover = db.query(RoverDevice).filter(RoverDevice.rover_id == rover_id_str).first()
     if not rover:
@@ -988,22 +1020,84 @@ def send_rover_command(
     if current_user.is_farmer():
         _verify_rover_farmer_access(rover, current_user, db)
 
-    cmd = (payload.get("command") or "").strip().upper()
+    raw_command = (payload.get("command") or payload.get("type") or "").strip().upper()
+    speed = payload.get("speed")
+    params = payload.get("params") or {}
+    if speed is not None:
+        params["speed"] = speed
+
+    command_aliases = {
+        "FORWARD": "MOVE_FORWARD",
+        "BACKWARD": "MOVE_BACKWARD",
+        "LEFT": "TURN_LEFT",
+        "RIGHT": "TURN_RIGHT",
+        "STOP": "STOP",
+        "MOVE_FORWARD": "MOVE_FORWARD",
+        "MOVE_BACKWARD": "MOVE_BACKWARD",
+        "TURN_LEFT": "TURN_LEFT",
+        "TURN_RIGHT": "TURN_RIGHT",
+        "START_FIELD_TASK": "START_AUTONOMOUS_MISSION",
+        "PAUSE_FIELD_TASK": "PAUSE_MISSION",
+        "RESUME_FIELD_TASK": "RESUME_MISSION",
+    }
+    cmd = command_aliases.get(raw_command, raw_command)
+
+    print(
+        f"[ROVER COMMAND] rover={rover_id_str} requested={raw_command} normalized={cmd} params={params}",
+        flush=True,
+    )
+
     valid_commands = {
         "MOVE_FORWARD", "MOVE_BACKWARD", "TURN_LEFT", "TURN_RIGHT", "STOP",
-        "START_FIELD_TASK", "PAUSE_FIELD_TASK", "RESUME_FIELD_TASK",
+        "START_AUTONOMOUS_MISSION", "PAUSE_MISSION", "RESUME_MISSION",
         "RETURN_HOME", "EMERGENCY_STOP", "START_SPRAYING", "STOP_SPRAYING",
         "CAPTURE_IMAGE", "RAISE_CAMERA", "LOWER_CAMERA", "ROTATE_NOZZLE",
     }
     if cmd not in valid_commands:
-        raise HTTPException(status_code=422, detail=f"Unknown command: {cmd}")
+        print(
+            f"[ROVER COMMAND] rover={rover_id_str} command={cmd} status=REJECTED reason=UNKNOWN_COMMAND",
+            flush=True,
+        )
+        raise HTTPException(status_code=422, detail=f"Unknown command: {raw_command}")
+
+    if cmd == "START_SPRAYING":
+        raise HTTPException(
+            status_code=400,
+            detail="Start spraying through /spraying/sessions so product and safety checks are enforced."
+        )
+
+    # Safety gate for movement commands
+    from services.safety import safety_engine
+    telemetry = mqtt_bridge.latest_telemetry.get(rover_id_str)
+    if cmd in {"MOVE_FORWARD", "MOVE_BACKWARD", "TURN_LEFT", "TURN_RIGHT", "STOP", "EMERGENCY_STOP"}:
+        safety_result = safety_engine.check_movement_conditions(rover, telemetry, cmd)
+        if not safety_result.passed:
+            log_activity(
+                db, f"ROVER_COMMAND_BLOCKED:{cmd}", actor=current_user,
+                resource_type="RoverDevice", resource_id=rover.id,
+                result="FAILED",
+                details={"command": cmd, "params": params, "reason": safety_result.reason},
+                ip_address=get_client_ip(request)
+            )
+            print(
+                f"[ROVER COMMAND] rover={rover_id_str} command={cmd} status=BLOCKED "
+                f"reason={safety_result.reason}",
+                flush=True,
+            )
+            raise HTTPException(status_code=400, detail=safety_result.reason)
+
+    print(
+        f"[ROVER COMMAND] rover={rover_id_str} command={cmd} status=SAFETY_PASSED "
+        f"movement={cmd in {'MOVE_FORWARD', 'MOVE_BACKWARD', 'TURN_LEFT', 'TURN_RIGHT', 'STOP', 'EMERGENCY_STOP'}}",
+        flush=True,
+    )
 
     # Create command record
     command_record = RoverCommand(
         rover_id=rover.id,
         issued_by=current_user.id,
         command=cmd,
-        params=payload.get("params"),
+        params=params,
         status=CommandStatus.PENDING,
     )
     db.add(command_record)
@@ -1011,7 +1105,11 @@ def send_rover_command(
     db.refresh(command_record)
 
     # Dispatch via MQTT
-    success = mqtt_bridge.dispatch_command(rover_id_str, cmd, payload.get("params") or {})
+    success = mqtt_bridge.dispatch_command(rover_id_str, cmd, params)
+    print(
+        f"[ROVER COMMAND] rover={rover_id_str} command={cmd} dispatch={'SUCCESS' if success else 'FAILED'}",
+        flush=True,
+    )
 
     command_record.status = CommandStatus.SENT if success else CommandStatus.FAILED
     if not success:
@@ -1022,7 +1120,7 @@ def send_rover_command(
         db, f"ROVER_COMMAND:{cmd}", actor=current_user,
         resource_type="RoverDevice", resource_id=rover.id,
         result="SUCCESS" if success else "FAILED",
-        details={"command": cmd, "params": payload.get("params"), "command_id": command_record.id},
+        details={"command": cmd, "params": params, "command_id": command_record.id},
         ip_address=get_client_ip(request)
     )
 
@@ -1039,7 +1137,48 @@ def send_rover_command(
         "status": "SENT",
         "command": cmd,
         "rover_id": rover_id_str,
+        "params": params,
     }
+
+
+@api_router.post("/rovers/{rover_id_str}/stop")
+def stop_rover(
+    rover_id_str: str,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_from_token),
+):
+    payload = payload or {}
+    return send_rover_command(rover_id_str, {"command": "STOP", "params": payload.get("params") or {}}, request=Request(scope={}), db=db, current_user=current_user)
+
+
+@api_router.post("/rovers/{rover_id_str}/emergency-stop")
+def emergency_stop_rover(
+    rover_id_str: str,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_from_token),
+):
+    payload = payload or {}
+    return send_rover_command(rover_id_str, {"command": "EMERGENCY_STOP", "params": payload.get("params") or {}}, request=Request(scope={}), db=db, current_user=current_user)
+
+
+@api_router.post("/rovers/{rover_id_str}/reset-emergency")
+def reset_emergency_rover(
+    rover_id_str: str,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_from_token),
+):
+    payload = payload or {}
+    rover = db.query(RoverDevice).filter(RoverDevice.rover_id == rover_id_str).first()
+    if not rover:
+        raise HTTPException(status_code=404, detail="Rover not found.")
+    rover.status = RoverStatus.IDLE
+    rover.connection_status = RoverStatus.ONLINE
+    rover.mode = RoverMode.MANUAL
+    db.commit()
+    return {"message": "Emergency stop reset acknowledged.", "rover_id": rover_id_str}
 
 
 @api_router.post("/rovers/{rover_id_str}/telemetry")
@@ -1055,6 +1194,23 @@ def receive_telemetry(
     rover = db.query(RoverDevice).filter(RoverDevice.rover_id == rover_id_str).first()
     if not rover:
         return {"error": "Rover not found"}
+
+    telemetry_status = payload.get("rover_status") or rover.status or RoverStatus.OFFLINE
+    telemetry_mode = payload.get("mode") or rover.mode or RoverMode.MANUAL
+
+    rover.status = telemetry_status
+    rover.connection_status = RoverStatus.ONLINE
+    rover.mode = telemetry_mode
+    rover.battery_level = payload.get("battery_pct") if payload.get("battery_pct") is not None else rover.battery_level
+    rover.speed = payload.get("speed_kmh") if payload.get("speed_kmh") is not None else rover.speed
+    rover.latitude = payload.get("latitude") if payload.get("latitude") is not None else rover.latitude
+    rover.longitude = payload.get("longitude") if payload.get("longitude") is not None else rover.longitude
+    rover.camera_status = "ONLINE" if payload.get("camera_active") else "OFFLINE"
+    rover.gps_status = "ONLINE" if payload.get("gps_available") else "OFFLINE"
+    rover.imu_status = "ONLINE" if payload.get("imu_available") or payload.get("imu_status") else "OFFLINE"
+    rover.spraying_status = "ACTIVE" if payload.get("pump_active") else "READY"
+    rover.autonomous_status = "ON" if telemetry_mode == RoverMode.AUTONOMOUS else "OFF"
+    rover.last_seen = datetime.utcnow()
 
     telemetry = RoverTelemetry(
         rover_id=rover.id,
@@ -1072,7 +1228,13 @@ def receive_telemetry(
         solenoid_open=payload.get("solenoid_open"),
         camera_active=payload.get("camera_active"),
         gps_available=payload.get("gps_available"),
-        rover_status=payload.get("rover_status"),
+        rover_status=telemetry_status,
+        mode=telemetry_mode,
+        spraying=payload.get("pump_active"),
+        camera=payload.get("camera_active"),
+        gps=payload.get("gps_available"),
+        imu=payload.get("imu_available") or payload.get("imu_status"),
+        timestamp=datetime.utcnow(),
     )
     db.add(telemetry)
     db.commit()
@@ -1180,6 +1342,12 @@ async def analyze_crop_image(
     current_user: User = Depends(get_current_user_from_token)
 ):
     """Analyze a single crop image for health problems."""
+    if not field_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Disease detection can only be performed inside a farm area. Select a farm field first.",
+        )
+
     # Validate file
     allowed_types = {"image/jpeg", "image/png", "image/webp"}
     if file.content_type not in allowed_types:
@@ -1190,20 +1358,47 @@ async def analyze_crop_image(
         raise HTTPException(status_code=422, detail="Image file size must be under 20MB.")
 
     # Verify field ownership if provided
-    if field_id:
-        field = db.query(Field).filter(Field.id == field_id).first()
-        if field:
-            verify_field_ownership(field, current_user, db)
+    field = db.query(Field).filter(Field.id == field_id).first()
+    if not field:
+        raise HTTPException(status_code=404, detail="Selected farm field was not found.")
+    verify_field_ownership(field, current_user, db)
 
     # Run AI analysis
     ai_provider = get_ai_vision_provider()
     try:
         result = await ai_provider.analyze_crop_image(contents, file.filename)
     except Exception as e:
+        print(
+            f"[DISEASE DETECTION] status=ERROR field_id={field_id} filename={file.filename} "
+            f"reason={type(e).__name__}: {e} image_size_bytes={len(contents)}",
+            flush=True,
+        )
         raise HTTPException(
             status_code=503,
             detail="Crop analysis is temporarily unavailable. Please try again later."
         )
+
+    _print_crop_analysis_result(result, field_id, file.filename, len(contents))
+
+    # Do not persist or upload synthetic fallback results as real detections.
+    if not result.analysis_available:
+        return {
+            "id": None,
+            "field_id": field_id,
+            "crop_id": crop_id,
+            "detection_type": "Unavailable",
+            "label": "Analysis unavailable",
+            "confidence": 0.0,
+            "severity": "None",
+            "is_healthy": True,
+            "source": "IMAGE_UPLOAD",
+            "description": "No OpenRouter vision model is configured. No disease decision was made.",
+            "recommendations": "Configure OPENROUTER_API_KEY and set USE_MOCK_AI_PROVIDER=false for real analysis.",
+            "created_at": datetime.utcnow().isoformat(),
+            "evidence": [],
+            "analysis_available": False,
+            "evidence_storage": "not_stored",
+        }
 
     # Upload evidence to Cloudinary
     image_url = None
@@ -1254,7 +1449,10 @@ async def analyze_crop_image(
                  resource_type="CropHealthRecord", resource_id=record.id,
                  details={"detection_type": result.detection_type, "label": result.label})
 
-    return _format_health_record(record)
+    response = _format_health_record(record)
+    response["analysis_available"] = True
+    response["evidence_storage"] = "cloudinary" if cloudinary_id else "not_stored"
+    return response
 
 
 @api_router.post("/crop-health/analyze-video")
@@ -1272,6 +1470,17 @@ async def submit_video_analysis(
     Only useful frames are analyzed; evidence regions uploaded to Cloudinary.
     Original video is deleted unless farmer explicitly requests saving it.
     """
+    if not field_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Disease detection can only be performed inside a farm area. Select a farm field first.",
+        )
+
+    field = db.query(Field).filter(Field.id == field_id).first()
+    if not field:
+        raise HTTPException(status_code=404, detail="Selected farm field was not found.")
+    verify_field_ownership(field, current_user, db)
+
     allowed_video_types = {"video/mp4", "video/quicktime", "video/x-msvideo", "video/webm"}
     if file.content_type not in allowed_video_types:
         raise HTTPException(status_code=422, detail="Only MP4, MOV, AVI, or WebM videos are accepted.")
@@ -1478,10 +1687,17 @@ def start_spray_session(
     db.refresh(session)
 
     # Dispatch command to rover
-    mqtt_bridge.dispatch_command(rover_id_str, "START_SPRAYING", {
+    dispatch_ok = mqtt_bridge.dispatch_command(rover_id_str, "START_SPRAYING", {
         "session_id": session.id,
         "spray_height_cm": payload.get("spray_height_cm"),
     })
+
+    if not dispatch_ok:
+        session.status = SprayStatus.FAILED
+        session.aborted_reason = "Rover did not accept the spray command."
+        session.completed_at = datetime.utcnow()
+        db.commit()
+        raise HTTPException(status_code=503, detail="Rover did not accept the spray command.")
 
     log_activity(db, "SPRAYING_STARTED", actor=current_user,
                  resource_type="SpraySession", resource_id=session.id,
@@ -1503,6 +1719,9 @@ def stop_spray_session(
 
     if current_user.is_farmer() and session.initiated_by != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied.")
+
+    if session.status != SprayStatus.RUNNING:
+        return _format_spray_session(session)
 
     session.status = SprayStatus.COMPLETED
     session.completed_at = datetime.utcnow()
@@ -1616,7 +1835,7 @@ def _format_product(p: Product) -> dict:
         "safety_notes": p.safety_notes,
         "recommended_quantity": p.recommended_quantity,
         "is_active": p.is_active,
-        "created_at": p.created_at.isoformat(),
+        "created_at": p.created_at.isoformat() if p.created_at else None,
     }
 
 

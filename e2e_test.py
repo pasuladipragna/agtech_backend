@@ -1,4 +1,4 @@
-﻿import httpx, time, sys
+import httpx, time, sys
 from datetime import datetime
 
 BASE = "http://localhost:8000/api/v1"
@@ -49,7 +49,7 @@ log("PASS" if r and r.status_code==200 else "FAIL", "Health", "GET / root", "", 
 
 # 1. AUTH
 print("\n-- 1. Authentication")
-r = req("POST", "/auth/login", {"email": "admin@agritech.com", "password": "admin123"})
+r = req("POST", "/auth/login", {"email": "admin@agritech.com", "password": "Admin@123456"})
 if r and r.status_code == 200:
     d = r.json(); admin_token = d.get("access_token")
     log("PASS", "Auth", "Admin login", "role=" + d["user"]["role"], 200)
@@ -139,6 +139,8 @@ if farmer_token:
     if r and r.status_code == 200:
         ff = r.json()
         if ff and not farm_id: farm_id = ff[0]["id"]
+        # Ensure we use the farm owned by this farmer
+        farm_id = ff[-1]["id"] if ff else farm_id
         log("PASS", "Farms", "GET /farms farmer", "count=" + str(len(ff)), 200)
     else:
         log("FAIL", "Farms", "GET /farms farmer", getattr(r,"text",""), getattr(r,"status_code",None))
@@ -196,7 +198,7 @@ else:
     log("FAIL", "Rovers", "GET /rovers", getattr(r,"text",""), getattr(r,"status_code",None))
 
 nrid = "ROVER-E2E-" + TS
-r = req("POST", "/rovers", {"rover_id": nrid, "name": "E2E Rover " + TS, "description": "E2E"}, token=admin_token)
+r = req("POST", "/admin/rovers", {"rover_id": nrid, "name": "E2E Rover " + TS, "description": "E2E"}, token=admin_token)
 if r and r.status_code == 201:
     rover_db_id = r.json().get("id"); rover_hw_id = nrid
     log("PASS", "Rovers", "POST /rovers", "id=" + str(rover_db_id), 201)
@@ -208,7 +210,7 @@ if rover_hw_id:
     log("PASS" if r and r.status_code==200 else "FAIL", "Rovers", "GET /rovers/:rover_id", "", getattr(r,"status_code",None))
 
 if rover_db_id and farm_id:
-    r = req("POST", "/rovers/assignments", {"rover_id": rover_db_id, "farm_id": farm_id}, token=admin_token)
+    r = req("POST", "/admin/rovers/" + rover_db_id + "/assign", {"farm_id": farm_id}, token=admin_token)
     log("PASS" if r and r.status_code in (200,201) else "WARN", "Rovers", "POST /rovers/assignments", getattr(r,"text",""), getattr(r,"status_code",None))
 
 if rover_hw_id:
@@ -227,7 +229,7 @@ if farmer_uid:
 print("\n-- 10. Products")
 r = req("GET", "/products", token=admin_token)
 log("PASS" if r and r.status_code==200 else "FAIL", "Products", "GET /products", "count=" + str(len(r.json()) if r and r.status_code==200 else "?"), getattr(r,"status_code",None))
-r = req("POST", "/products", {"name": "E2E Pesticide " + TS, "product_type": "Pesticide", "target_crop": "Wheat"}, token=admin_token)
+r = req("POST", "/admin/products", {"name": "E2E Pesticide " + TS, "product_type": "Pesticide", "target_crop": "Wheat"}, token=admin_token)
 log("PASS" if r and r.status_code==201 else "FAIL", "Products", "POST /products", getattr(r,"text",""), getattr(r,"status_code",None))
 if farmer_token:
     r = req("POST", "/products", {"name": "Hack", "product_type": "Pesticide"}, token=farmer_token)
@@ -312,8 +314,47 @@ if r and r.status_code==200:
 else:
     log("WARN", "Docs", "GET /openapi.json", "", getattr(r,"status_code",None))
 
-# 19. CLEANUP
-print("\n-- 19. Cleanup")
+# 19. CROP DETECTION
+print("\n-- 19. Crop Detection")
+if field_id:
+    # Test Analyze Image
+    img_path = "test_e2e_leaf.jpg"
+    with open(img_path, "wb") as f:
+        f.write(b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xdb\x00C\x00\x03\x02\x02\x02\x02\x02\x03\x02\x02\x02\x03\x03\x03\x03\x04\x06\x04\x04\x04\x04\x04\x08\x06\x06\x05\x06\t\x08\n\n\t\x08\t\t\n\x0c\x0f\x0c\n\x0b\x0e\x0b\t\t\r\x11\r\x0e\x0f\x10\x10\x11\x10\n\x0c\x12\x13\x12\x10\x13\x0f\x10\x10\x10\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xda\x00\x08\x01\x01\x00\x00?\x00\x00\xff\xd9')
+    
+    data = {"field_id": field_id}
+    if crop_id:
+        data["crop_id"] = crop_id
+    
+    import httpx, os
+    with httpx.Client() as client:
+        with open(img_path, "rb") as f:
+            r = client.post(
+                f"{BASE}/crop-health/analyze-image", 
+                headers={"Authorization": f"Bearer {admin_token}"},
+                data=data,
+                files={"file": ("test_e2e_leaf.jpg", f, "image/jpeg")}
+            )
+        log("PASS" if r.status_code==200 else "FAIL", "Detection", "POST /crop-health/analyze-image", f"type={r.json().get('detection_type')} available={r.json().get('analysis_available')}" if r.status_code==200 else "", getattr(r,"status_code",None))
+        
+        # Test Analyze Video
+        vid_path = "test_e2e_video.mp4"
+        with open(vid_path, "wb") as f:
+            f.write(b'\x00\x00\x00\x1cftypisom\x00\x00\x02\x00isomiso2avc1mp41\x00\x00\x00\x08free')
+        with open(vid_path, "rb") as f:
+            r_vid = client.post(
+                f"{BASE}/crop-health/analyze-video", 
+                headers={"Authorization": f"Bearer {admin_token}"},
+                data=data,
+                files={"file": ("test_e2e_video.mp4", f, "video/mp4")}
+            )
+        log("PASS" if r_vid.status_code==200 else "FAIL", "Detection", "POST /crop-health/analyze-video", f"job_id={r_vid.json().get('job_id')}" if r_vid.status_code==200 else "", getattr(r_vid,"status_code",None))
+        
+        os.remove(img_path)
+        os.remove(vid_path)
+
+# 20. CLEANUP
+print("\n-- 20. Cleanup")
 if field_id:
     tok = farmer_token or admin_token
     r = req("DELETE", "/fields/" + field_id, token=tok)

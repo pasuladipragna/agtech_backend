@@ -21,6 +21,29 @@ def ensure_database_schema(bind):
     """Add missing columns to existing SQLite databases created before the latest model schema."""
     inspector = inspect(bind)
     table_columns = {
+        "rover_devices": {
+            "status": "VARCHAR(30) DEFAULT 'OFFLINE'",
+            "connection_status": "VARCHAR(30) DEFAULT 'OFFLINE'",
+            "mode": "VARCHAR(30) DEFAULT 'MANUAL'",
+            "battery_level": "FLOAT",
+            "speed": "FLOAT",
+            "latitude": "FLOAT",
+            "longitude": "FLOAT",
+            "camera_status": "VARCHAR(30) DEFAULT 'OFFLINE'",
+            "gps_status": "VARCHAR(30) DEFAULT 'OFFLINE'",
+            "imu_status": "VARCHAR(30) DEFAULT 'OFFLINE'",
+            "spraying_status": "VARCHAR(30) DEFAULT 'READY'",
+            "autonomous_status": "VARCHAR(30) DEFAULT 'OFF'",
+            "last_seen": "DATETIME",
+        },
+        "rover_telemetry": {
+            "mode": "VARCHAR(30)",
+            "spraying": "BOOLEAN",
+            "camera": "BOOLEAN",
+            "gps": "BOOLEAN",
+            "imu": "BOOLEAN",
+            "timestamp": "DATETIME",
+        },
         "notifications": {
             "notification_type": "VARCHAR(30) DEFAULT 'INFO'",
             "link": "VARCHAR(500)",

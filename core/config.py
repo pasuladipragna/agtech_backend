@@ -59,7 +59,9 @@ class Settings(BaseSettings):
     
     # AI OpenRouter
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
-    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
+    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "inclusionai/ling-3.0-flash-vl:free")
+    OPENROUTER_MODELS: str = os.getenv("OPENROUTER_MODELS", "")
+    OPENROUTER_MODEL_STRATEGY: str = os.getenv("OPENROUTER_MODEL_STRATEGY", "balanced")
     USE_MOCK_AI_PROVIDER: bool = os.getenv("USE_MOCK_AI_PROVIDER", "true").lower() == "true"
 
     class Config:

@@ -31,7 +31,10 @@ class MediaStorageService:
                     public_id=f"evidence_{uuid.uuid4().hex[:8]}"
                 )
                 logger.info(f"Uploaded evidence image to Cloudinary: {res.get('secure_url')}")
-                return res.get("secure_url")
+                return {
+                    "url": res.get("secure_url"),
+                    "public_id": res.get("public_id"),
+                }
             except Exception as e:
                 logger.error(f"Cloudinary upload failed ({e}). Falling back to local storage.")
 
@@ -44,6 +47,6 @@ class MediaStorageService:
             
         local_url = f"/static/uploads/{unique_name}"
         logger.info(f"Saved evidence image locally: {local_url}")
-        return local_url
+        return {"url": local_url, "public_id": None}
 
 media_service = MediaStorageService()

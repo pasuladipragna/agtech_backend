@@ -46,9 +46,21 @@ MOCK_DISEASES = [
 
 class MockVisionProvider(AIVisionProvider):
     async def analyze_crop_image(self, image_data: bytes, filename: str) -> DiseaseDetectionResult:
-        idx = hash(filename) % len(MOCK_DISEASES)
-        data = MOCK_DISEASES[idx]
-        return DiseaseDetectionResult(**data)
+        import random
+        # Pick a random mock disease to simulate a real detection
+        det = random.choice(MOCK_DISEASES)
+        return DiseaseDetectionResult(
+            analysis_available=True,
+            plant_present=True,
+            is_healthy=det["is_healthy"],
+            label=det["label"],
+            confidence=det["confidence"],
+            severity=det["severity"],
+            category=det["category"],
+            recommended_treatment=det["recommended_treatment"],
+            recommended_spray_volume_l_per_ha=det["recommended_spray_volume_l_per_ha"],
+            description=det["description"],
+        )
 
     async def analyze_video_keyframes(self, keyframe_images: List[bytes]) -> VideoKeyframeAnalysisResult:
         useful_frames = []

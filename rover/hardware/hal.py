@@ -89,6 +89,12 @@ class RoverHAL:
         self.longitude = -119.417931
         self.heading_deg = 45.0
         self.speed_kmh = 0.0
+        self.mode = "MANUAL"
+        self.rover_status = "IDLE"
+        self.camera_active = False
+        self.gps_available = True
+        self.imu_available = True
+        self.spraying = False
 
     def execute_high_level_command(self, cmd: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         cmd = cmd.upper()
@@ -98,24 +104,33 @@ class RoverHAL:
             speed = params.get("speed_pct", 60.0)
             self.motors.set_motors(speed, speed)
             self.speed_kmh = (speed / 100.0) * 4.5
+            self.rover_status = "MOVING"
         elif cmd == "MOVE_BACKWARD":
             speed = params.get("speed_pct", 40.0)
             self.motors.set_motors(-speed, -speed)
             self.speed_kmh = -(speed / 100.0) * 3.0
+            self.rover_status = "MOVING"
         elif cmd == "TURN_LEFT":
             self.motors.set_motors(-35.0, 35.0)
             self.heading_deg = (self.heading_deg - 15.0) % 360
+            self.rover_status = "MOVING"
         elif cmd == "TURN_RIGHT":
             self.motors.set_motors(35.0, -35.0)
             self.heading_deg = (self.heading_deg + 15.0) % 360
+            self.rover_status = "MOVING"
         elif cmd == "STOP":
             self.motors.stop()
             self.speed_kmh = 0.0
+            self.rover_status = "IDLE"
         elif cmd == "START_SPRAYING":
             self.spray.start_pump()
             self.spray.pulse_solenoid(params.get("pulse_ms", 500))
+            self.rover_status = "SPRAYING"
+            self.spraying = True
         elif cmd == "STOP_SPRAYING":
             self.spray.stop_pump()
+            self.rover_status = "IDLE"
+            self.spraying = False
         elif cmd == "RAISE_CAMERA":
             self.camera_mount.adjust_height(self.camera_mount.current_height_cm + 15.0)
         elif cmd == "LOWER_CAMERA":
@@ -127,6 +142,8 @@ class RoverHAL:
             self.motors.stop()
             self.spray.stop_pump()
             self.speed_kmh = 0.0
+            self.rover_status = "EMERGENCY_STOP"
+            self.spraying = False
             logger.critical("[HAL] EMERGENCY STOP TRIGGERED!")
             return {"status": "EMERGENCY_STOPPED", "success": True}
         else:
@@ -143,6 +160,8 @@ class RoverHAL:
             self.latitude += (dist_delta * math.cos(rad)) / 111.0
             self.longitude += (dist_delta * math.sin(rad)) / (111.0 * math.cos(math.radians(self.latitude)))
 
+        self.rover_status = self.rover_status if self.rover_status in {"MOVING", "SPRAYING", "EMERGENCY_STOP", "IDLE"} else "IDLE"
+
         return {
             "battery_pct": round(self.power.battery_pct, 1),
             "voltage": round(self.power.voltage, 2),
@@ -158,4 +177,10 @@ class RoverHAL:
             "speed_kmh": round(self.speed_kmh, 2),
             "left_motor_pwm": self.motors.left_speed,
             "right_motor_pwm": self.motors.right_speed,
+            "rover_status": self.rover_status,
+            "mode": self.mode,
+            "camera_active": self.camera_active,
+            "gps_available": self.gps_available,
+            "imu_available": self.imu_available,
+            "spraying": self.spraying,
         }

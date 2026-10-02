@@ -1,18 +1,23 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from datetime import datetime, date, timezone
+from math import cos, radians, sqrt
 from typing import Optional, List, Dict, Any
 import uuid
 import httpx
 
 from core.database import get_db
+from core.config import settings
 from iot.mqtt import mqtt_bridge
 from core.security import require_farmer, require_admin, get_current_user_from_token, get_password_hash, verify_password
+from modules.router import send_rover_command
+from rover.navigation.lane_planner import LaneConfig, LanePlanningError, generate_lanes, recalculate_route
+from rover.navigation.field_detection import FieldDetectionService
 from models import (
-    User, UserRole, Farm, Field, Crop, RoverDevice, RoverAssignment, RoverTelemetry, 
+    User, UserRole, FarmerProfile, Farm, Field, Crop, RoverDevice, RoverAssignment, RoverTelemetry, 
     Notification, NotificationType, CropHealthRecord, RegistrationRequest, RegistrationStatus, 
     ActivityLog, SpraySession, WeatherRecord, Report, SupportTicket, SupportMessage, 
-    TicketStatus, CommunityPost, CommunityComment
+    TicketStatus, CommunityPost, CommunityComment, RoverTask
 )
 
 extra_router = APIRouter()
@@ -24,10 +29,13 @@ def _rover_is_connected(rover_id: str, telemetry: Optional[RoverTelemetry] = Non
         received_at and
         (datetime.now(timezone.utc) - received_at).total_seconds() <= 15
     )
-    db_live = bool(
-        telemetry and
-        (datetime.utcnow() - telemetry.recorded_at).total_seconds() <= 15
-    )
+
+    db_live = False
+    if telemetry and telemetry.recorded_at is not None:
+        db_live = bool(
+            (datetime.now(timezone.utc) - telemetry.recorded_at).total_seconds() <= 15
+        )
+
     return mqtt_live or db_live
 
 # ============================================================
@@ -164,6 +172,60 @@ def update_farmer_farm(farm_id: str, payload: dict, db: Session = Depends(get_db
         "latitude": farm.latitude,
         "longitude": farm.longitude,
     }
+
+# ============================================================
+# FARM SETTINGS
+# ============================================================
+
+@extra_router.get("/farmer/settings")
+def get_farmer_settings(db: Session = Depends(get_db), current_user: User = Depends(require_farmer)):
+    profile = current_user.farmer_profile
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+        
+    farm = db.query(Farm).filter(Farm.farmer_id == profile.id).first()
+    if not farm:
+        raise HTTPException(status_code=404, detail="Farm not found")
+        
+    return {
+        "farm_name": farm.name,
+        "weather_location": farm.weather_location,
+        "timezone": farm.timezone,
+        "auto_spray_enabled": farm.auto_spray_enabled,
+        "auto_scan_enabled": farm.auto_scan_enabled,
+        "spray_interval_hours": farm.spray_interval_hours,
+        "scan_interval_hours": farm.scan_interval_hours,
+        "alert_email_enabled": farm.alert_email_enabled,
+        "alert_sms_enabled": farm.alert_sms_enabled,
+        "alert_phone": farm.alert_phone
+    }
+
+@extra_router.put("/farmer/settings")
+def update_farmer_settings(payload: dict, db: Session = Depends(get_db), current_user: User = Depends(require_farmer)):
+    profile = current_user.farmer_profile
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+        
+    farm = db.query(Farm).filter(Farm.farmer_id == profile.id).first()
+    if not farm:
+        raise HTTPException(status_code=404, detail="Farm not found")
+        
+    if "farm_name" in payload:
+        farm.name = payload["farm_name"]
+    
+    settings_fields = [
+        "weather_location", "timezone", "auto_spray_enabled", "auto_scan_enabled",
+        "spray_interval_hours", "scan_interval_hours", "alert_email_enabled",
+        "alert_sms_enabled", "alert_phone"
+    ]
+    
+    for field in settings_fields:
+        if field in payload:
+            setattr(farm, field, payload[field])
+            
+    db.commit()
+    return {"message": "Settings updated successfully"}
+
 
 
 @extra_router.get("/farmer/geocode")
@@ -407,6 +469,223 @@ def admin_unassign_rover(
 # FARMER ROVER TELEMETRY & STATUS
 # ============================================================
 
+@extra_router.post("/rover/command")
+def send_compat_rover_command(
+    payload: dict,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_from_token)
+):
+    """Compatibility alias used by the farmer UI and local mock rover flows."""
+    rover_id = payload.get("rover_id") or payload.get("roverId")
+    if rover_id is None:
+        profile = current_user.farmer_profile
+        if not profile:
+            raise HTTPException(status_code=400, detail="No rover_id provided and no farmer profile is available.")
+        farm = db.query(Farm).filter(Farm.farmer_id == profile.id).first()
+        if not farm:
+            raise HTTPException(status_code=404, detail="No farm found for this farmer.")
+        assignment = db.query(RoverAssignment).filter(
+            RoverAssignment.farm_id == farm.id,
+            RoverAssignment.is_active == True
+        ).first()
+        if not assignment:
+            raise HTTPException(status_code=404, detail="No rover is assigned to this farmer.")
+        rover = db.query(RoverDevice).filter(RoverDevice.id == assignment.rover_id).first()
+        if not rover:
+            raise HTTPException(status_code=404, detail="Assigned rover not found.")
+        rover_id = rover.rover_id
+
+    return send_rover_command(rover_id, payload, request=request, db=db, current_user=current_user)
+
+
+def _farmer_field(db: Session, field_id: str, current_user: User) -> Field:
+    profile = current_user.farmer_profile
+    field = db.query(Field).filter(Field.id == field_id).first()
+    if not profile or not field:
+        raise HTTPException(status_code=404, detail="Field not found.")
+    farm = db.query(Farm).filter(Farm.id == field.farm_id, Farm.farmer_id == profile.id).first()
+    if not farm:
+        raise HTTPException(status_code=403, detail="You do not have access to this field.")
+    return field
+
+
+def _lane_config(payload: dict) -> LaneConfig:
+    return LaneConfig(
+        lane_spacing_m=float(payload.get("lane_spacing_m", payload.get("lane_spacing", 0.8))),
+        minimum_lane_spacing_m=float(payload.get("minimum_lane_spacing_m", 0.2)),
+        maximum_lane_spacing_m=float(payload.get("maximum_lane_spacing_m", 10.0)),
+        minimum_lane_length_m=float(payload.get("minimum_lane_length_m", 5.0)),
+        rover_clearance_m=float(payload.get("safety_clearance_m", payload.get("rover_clearance_m", 0.5))),
+    )
+
+
+def _planner_boundary(boundary: list) -> list:
+    """Convert geographic field coordinates to a local metre frame."""
+    if not boundary or any(len(point) < 2 for point in boundary):
+        return boundary
+    if not all(-90 <= float(point[0]) <= 90 and -180 <= float(point[1]) <= 180 for point in boundary):
+        return boundary
+
+    origin_lat, origin_lon = float(boundary[0][0]), float(boundary[0][1])
+    latitude_scale = 110540.0
+    longitude_scale = 111320.0 * cos(radians(origin_lat))
+    return [
+        [
+            round((float(latitude) - origin_lat) * latitude_scale, 3),
+            round((float(longitude) - origin_lon) * longitude_scale, 3),
+        ]
+        for latitude, longitude in boundary
+    ]
+
+
+def _assigned_rover(db: Session, farm_id: str, requested_rover_id: Optional[str] = None) -> RoverDevice:
+    if requested_rover_id:
+        rover = db.query(RoverDevice).filter(RoverDevice.id == requested_rover_id).first()
+        if rover:
+            assignment = db.query(RoverAssignment).filter(
+                RoverAssignment.rover_id == rover.id,
+                RoverAssignment.farm_id == farm_id,
+                RoverAssignment.is_active == True,
+            ).first()
+            if assignment:
+                return rover
+    assignment = db.query(RoverAssignment).filter(
+        RoverAssignment.farm_id == farm_id,
+        RoverAssignment.is_active == True,
+    ).first()
+    if not assignment:
+        raise HTTPException(status_code=409, detail="No active rover is assigned to this farm.")
+    rover = db.query(RoverDevice).filter(RoverDevice.id == assignment.rover_id).first()
+    if not rover:
+        raise HTTPException(status_code=404, detail="Assigned rover not found.")
+    return rover
+
+
+def _task_result(task: RoverTask) -> dict:
+    route = task.waypoints or {}
+    return {
+        "mission_id": task.id,
+        "task_code": task.task_code,
+        "field_id": task.field_id,
+        "status": task.status,
+        **route,
+    }
+
+
+@extra_router.post("/field/detect")
+def detect_field(
+    payload: dict,
+    current_user: User = Depends(require_farmer),
+):
+    """Accept normalized model output in simulation mode for later model replacement."""
+    result = FieldDetectionService().normalise_result(payload)
+    if not result["field_detected"] or not result.get("boundary"):
+        raise HTTPException(status_code=422, detail={"error_code": "NO_FIELD_DETECTED", "message": "No usable agricultural field was detected."})
+    if result["confidence"] < float(payload.get("minimum_confidence", 0.7)):
+        raise HTTPException(status_code=422, detail={"error_code": "LOW_FIELD_CONFIDENCE", "message": "Field boundary confidence is below the navigation threshold."})
+    return result
+
+
+@extra_router.post("/field/generate-lanes")
+def generate_field_lanes(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_farmer),
+):
+    """Generate a calibrated, obstacle-aware coverage route for one owned field."""
+    field = _farmer_field(db, str(payload.get("field_id", "")), current_user)
+    supplied_boundary = payload.get("boundary")
+    boundary = supplied_boundary or field.boundary_polygon
+    if not supplied_boundary:
+        boundary = _planner_boundary(boundary)
+    if not boundary and payload.get("field_width_m") and payload.get("field_length_m"):
+        width = float(payload["field_width_m"])
+        length = float(payload["field_length_m"])
+        boundary = [[0, 0], [width, 0], [width, length], [0, length]]
+    if not boundary and field.area_hectares and float(field.area_hectares) > 0:
+        side = sqrt(float(field.area_hectares) * 10000)
+        boundary = [[0, 0], [side, 0], [side, side], [0, side]]
+    if not boundary:
+        raise HTTPException(status_code=422, detail={"error_code": "NO_FIELD_BOUNDARY", "message": "A calibrated field boundary is required."})
+    rover = _assigned_rover(db, field.farm_id, payload.get("rover_db_id"))
+    try:
+        result = generate_lanes(boundary, _lane_config(payload), payload.get("obstacles", []))
+    except (TypeError, ValueError, LanePlanningError) as error:
+        raise HTTPException(status_code=422, detail={"error_code": "INVALID_LANE_CONFIGURATION", "message": str(error)})
+    if result["valid_lane_count"] == 0:
+        raise HTTPException(status_code=422, detail={"error_code": "NO_VALID_LANES", "message": "No valid navigation lanes could be generated from the detected field."})
+
+    task = RoverTask(
+        task_code=f"LANE-{uuid.uuid4().hex[:12].upper()}",
+        rover_id=rover.id,
+        farm_id=field.farm_id,
+        field_id=field.id,
+        created_by=current_user.id,
+        task_type="COVERAGE",
+        status="PENDING",
+        waypoints=result,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return _task_result(task)
+
+
+@extra_router.get("/field/lanes")
+def get_field_lanes(
+    field_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_farmer),
+):
+    field = _farmer_field(db, field_id, current_user)
+    task = db.query(RoverTask).filter(RoverTask.field_id == field.id).order_by(RoverTask.created_at.desc()).first()
+    if not task:
+        return {"field_id": field.id, "lane_count": 0, "lanes": [], "route": []}
+    return _task_result(task)
+
+
+@extra_router.post("/rover/navigation/recalculate")
+def recalculate_field_route(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_farmer),
+):
+    field = _farmer_field(db, str(payload.get("field_id", "")), current_user)
+    supplied_boundary = payload.get("boundary")
+    boundary = supplied_boundary or field.boundary_polygon
+    if not supplied_boundary:
+        boundary = _planner_boundary(boundary)
+    if not boundary and field.area_hectares and float(field.area_hectares) > 0:
+        side = sqrt(float(field.area_hectares) * 10000)
+        boundary = [[0, 0], [side, 0], [side, side], [0, side]]
+    if not boundary:
+        raise HTTPException(status_code=422, detail={"error_code": "NO_FIELD_BOUNDARY", "message": "A calibrated field boundary is required."})
+    previous = db.query(RoverTask).filter(RoverTask.field_id == field.id).order_by(RoverTask.created_at.desc()).first()
+    rover = _assigned_rover(db, field.farm_id, payload.get("rover_db_id") or (previous.rover_id if previous else None))
+    try:
+        result = generate_lanes(boundary, _lane_config(payload), payload.get("obstacles", []))
+        result = recalculate_route(previous.waypoints if previous else None, result)
+    except (TypeError, ValueError, LanePlanningError) as error:
+        raise HTTPException(status_code=422, detail={"error_code": "ROUTE_RECALCULATION_FAILED", "message": str(error)})
+    if result["valid_lane_count"] == 0:
+        raise HTTPException(status_code=422, detail={"error_code": "NO_VALID_LANES", "message": "No valid navigation lanes remain after recalculation."})
+    task = RoverTask(
+        task_code=f"LANE-{uuid.uuid4().hex[:12].upper()}",
+        rover_id=rover.id,
+        farm_id=field.farm_id,
+        field_id=field.id,
+        created_by=current_user.id,
+        task_type="COVERAGE",
+        status="PENDING",
+        waypoints=result,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return _task_result(task)
+
+
 @extra_router.get("/farmer/rover")
 def get_farmer_assigned_rover(
     db: Session = Depends(get_db),
@@ -435,19 +714,64 @@ def get_farmer_assigned_rover(
     latest_telemetry = db.query(RoverTelemetry).filter(
         RoverTelemetry.rover_id == rover.id
     ).order_by(RoverTelemetry.recorded_at.desc()).first()
+
+    # Local development has no broker until the first command is sent. Seed a
+    # neutral mock telemetry snapshot so the UI controls are not deadlocked.
+    if (
+        settings.ENV == "development"
+        and latest_telemetry is None
+        and rover.rover_id not in mqtt_bridge.latest_telemetry
+        and not mqtt_bridge.client.is_connected()
+    ):
+        mqtt_bridge._record_mock_telemetry(rover.rover_id, "STOP")
+        print(f"[ROVER MOCK] initialized command-ready telemetry for {rover.rover_id}", flush=True)
+
+    mqtt_telemetry = mqtt_bridge.latest_telemetry.get(rover.rover_id, {})
+    mqtt_received_at = mqtt_bridge.latest_telemetry_received_at.get(rover.rover_id)
+    mqtt_is_fresh = bool(
+        mqtt_received_at
+        and (datetime.now(timezone.utc) - mqtt_received_at).total_seconds() <= 15
+    )
+    if not mqtt_is_fresh:
+        mqtt_telemetry = {}
+
+    def live_value(field_name: str, fallback):
+        value = mqtt_telemetry.get(field_name)
+        return value if value is not None else fallback
     
+    live_status = live_value("rover_status", latest_telemetry.rover_status if latest_telemetry else rover.status)
+    live_mode = live_value("mode", latest_telemetry.mode if latest_telemetry else rover.mode)
+    live_camera = mqtt_telemetry.get("camera_active")
+    if live_camera is None:
+        live_camera = getattr(latest_telemetry, "camera_active", None)
+    if live_camera is None:
+        live_camera = rover.camera_status == "ONLINE"
+    live_gps = mqtt_telemetry.get("gps_available")
+    if live_gps is None:
+        live_gps = getattr(latest_telemetry, "gps_available", None)
+    if live_gps is None:
+        live_gps = rover.gps_status == "ONLINE"
+
     return {
         "id": rover.id,
         "rover_id": rover.rover_id,
         "name": rover.name,
         "description": rover.description,
         "is_connected": _rover_is_connected(rover.rover_id, latest_telemetry),
-        "battery_pct": latest_telemetry.battery_pct if latest_telemetry else None,
-        "spray_tank_pct": latest_telemetry.spray_tank_pct if latest_telemetry else None,
-        "speed_kmh": latest_telemetry.speed_kmh if latest_telemetry else None,
-        "rover_status": latest_telemetry.rover_status if latest_telemetry else None,
-        "latitude": latest_telemetry.latitude if latest_telemetry else None,
-        "longitude": latest_telemetry.longitude if latest_telemetry else None,
+        "battery_pct": live_value("battery_pct", latest_telemetry.battery_pct if latest_telemetry else rover.battery_level),
+        "spray_tank_pct": live_value("spray_tank_pct", latest_telemetry.spray_tank_pct if latest_telemetry else None),
+        "speed_kmh": live_value("speed_kmh", latest_telemetry.speed_kmh if latest_telemetry else rover.speed),
+        "rover_status": live_status,
+        "mode": live_mode,
+        "latitude": live_value("latitude", latest_telemetry.latitude if latest_telemetry else rover.latitude),
+        "longitude": live_value("longitude", latest_telemetry.longitude if latest_telemetry else rover.longitude),
+        "camera_active": live_camera,
+        "gps_available": live_gps,
+        "camera_status": rover.camera_status,
+        "gps_status": rover.gps_status,
+        "imu_status": rover.imu_status,
+        "spraying_status": rover.spraying_status,
+        "autonomous_status": rover.autonomous_status,
         "farm_name": farm.name,
         "assigned_since": assignment.assigned_at.isoformat() if assignment.assigned_at else None
     }

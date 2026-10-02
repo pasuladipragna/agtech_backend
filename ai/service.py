@@ -6,4 +6,7 @@ from ai.mock_provider import MockVisionProvider
 def get_ai_vision_provider() -> AIVisionProvider:
     if settings.USE_MOCK_AI_PROVIDER or not settings.OPENROUTER_API_KEY:
         return MockVisionProvider()
-    return OpenRouterVisionProvider()
+    return OpenRouterVisionProvider(
+        models=settings.OPENROUTER_MODELS,
+        strategy=settings.OPENROUTER_MODEL_STRATEGY,
+    )

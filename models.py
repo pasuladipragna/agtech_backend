@@ -46,8 +46,15 @@ class RoverStatus:
     IDLE = "IDLE"
     MOVING = "MOVING"
     SPRAYING = "SPRAYING"
+    AUTONOMOUS = "AUTONOMOUS"
+    ERROR = "ERROR"
     EMERGENCY_STOP = "EMERGENCY_STOP"
     CHARGING = "CHARGING"
+    MAINTENANCE = "MAINTENANCE"
+
+class RoverMode:
+    MANUAL = "MANUAL"
+    AUTONOMOUS = "AUTONOMOUS"
     MAINTENANCE = "MAINTENANCE"
 
 class CommandStatus:
@@ -242,6 +249,17 @@ class Farm(Base):
     total_area_hectares = Column(Float, nullable=True)
     description = Column(Text, nullable=True)
     main_crop_types = Column(String(500), nullable=True)
+    
+    # Settings
+    weather_location = Column(String(255), nullable=True)
+    timezone = Column(String(50), default="Asia/Kolkata")
+    auto_spray_enabled = Column(Boolean, default=False)
+    auto_scan_enabled = Column(Boolean, default=True)
+    spray_interval_hours = Column(Integer, default=24)
+    scan_interval_hours = Column(Integer, default=6)
+    alert_email_enabled = Column(Boolean, default=True)
+    alert_sms_enabled = Column(Boolean, default=False)
+    alert_phone = Column(String(50), nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -307,6 +325,20 @@ class RoverDevice(Base):
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     hardware_spec = Column(JSON, nullable=True)   # motors, pump, tank capacity, etc.
+
+    status = Column(String(30), default=RoverStatus.OFFLINE, nullable=False)
+    connection_status = Column(String(30), default=RoverStatus.OFFLINE, nullable=False)
+    mode = Column(String(30), default=RoverMode.MANUAL, nullable=False)
+    battery_level = Column(Float, nullable=True)
+    speed = Column(Float, nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    camera_status = Column(String(30), default="OFFLINE", nullable=True)
+    gps_status = Column(String(30), default="OFFLINE", nullable=True)
+    imu_status = Column(String(30), default="OFFLINE", nullable=True)
+    spraying_status = Column(String(30), default="READY", nullable=True)
+    autonomous_status = Column(String(30), default="OFF", nullable=True)
+    last_seen = Column(DateTime, nullable=True)
 
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -385,6 +417,12 @@ class RoverTelemetry(Base):
     camera_active = Column(Boolean, nullable=True)
     gps_available = Column(Boolean, nullable=True)
     rover_status = Column(String(30), nullable=True)
+    mode = Column(String(30), nullable=True)
+    spraying = Column(Boolean, nullable=True)
+    camera = Column(Boolean, nullable=True)
+    gps = Column(Boolean, nullable=True)
+    imu = Column(Boolean, nullable=True)
+    timestamp = Column(DateTime, nullable=True)
 
     recorded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
