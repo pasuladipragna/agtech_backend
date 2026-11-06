@@ -1,0 +1,17 @@
+﻿[Unit]
+Description=Smart AgriTech Rover Client
+After=network.target pigpiod.service mosquitto.service
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/agtech_rover
+EnvironmentFile=/home/pi/agtech_rover/.env
+ExecStartPre=/usr/bin/sleep 3
+ExecStart=/usr/bin/python3 /home/pi/agtech_rover/pi_rover.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

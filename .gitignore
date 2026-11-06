@@ -1,0 +1,37 @@
+# Python / FastAPI Backend Gitignore
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments & Virtualenv
+.venv/
+venv/
+ENV/
+env/
+
+# Environment configuration
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+!.env.example
+
+# Database & Storage
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+media/
+media_storage/
+
+# Logs & System files
+*.log
+.DS_Store
+Thumbs.db
