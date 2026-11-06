@@ -147,7 +147,7 @@ class BackendMQTTBridge:
                 f"{settings.MQTT_BROKER_HOST}:{settings.MQTT_BROKER_PORT} ..."
             )
         except Exception as e:
-            msg = f"[MQTT] ⚠️  Broker connect failed ({e}). Running with in-memory telemetry pool."
+            msg = f"[MQTT] Broker connect failed ({e}). Running with in-memory telemetry pool."
             logger.warning(msg)
             print(msg, flush=True)
 

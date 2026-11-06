@@ -23,11 +23,10 @@ class Settings(BaseSettings):
     CORS_ORIGINS: List[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "*"
     ]
     
     # Database
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./smart_agritech.db")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://agri_user:agri_password_2026@localhost:5432/smart_agritech")
     
     # MQTT Settings
     MQTT_BROKER_HOST: str = os.getenv("MQTT_BROKER_HOST", "localhost")
@@ -68,3 +67,9 @@ class Settings(BaseSettings):
         case_sensitive = True
 
 settings = Settings()
+
+if settings.ENV.lower() == "production" and (
+    not settings.SECRET_KEY
+    or settings.SECRET_KEY == "agritech-super-secret-key-change-in-production-2026"
+):
+    raise RuntimeError("Set a unique SECRET_KEY before starting in production.")

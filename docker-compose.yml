@@ -1,0 +1,114 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: agritech_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: agri_user
+      POSTGRES_PASSWORD: agri_password_2026
+      POSTGRES_DB: smart_agritech
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agri_user -d smart_agritech"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # pgAdmin Database Manager
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: agritech_pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@agritech.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: agritech_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # Eclipse Mosquitto MQTT Broker
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: agritech_mosquitto
+    restart: always
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./raspberry_pi/mosquitto.conf:/mosquitto/config/mosquitto.conf
+
+  # FastAPI Backend Service
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agritech_api
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://agri_user:agri_password_2026@postgres:5432/smart_agritech
+      - REDIS_URL=redis://redis:6379/0
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      mosquitto:
+        condition: service_started
+
+  # Web Frontend (Next.js Application)
+  web:
+    build:
+      context: ../agtech_frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+        NEXT_PUBLIC_WS_URL: ws://localhost:8000/ws
+    container_name: agritech_web
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws
+    depends_on:
+      - api
+
+  # Rover Controller Daemon / Simulator
+  rover_controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.rover
+    container_name: agritech_rover
+    restart: always
+    environment:
+      - ROVER_MQTT_BROKER=mosquitto
+      - ROVER_MQTT_PORT=1883
+      - ROVER_ID=ROVER-4WD-01
+    depends_on:
+      - mosquitto
+
+volumes:
+  postgres_data:
+  redis_data:

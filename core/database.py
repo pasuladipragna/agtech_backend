@@ -19,6 +19,9 @@ Base = declarative_base()
 
 def ensure_database_schema(bind):
     """Add missing columns to existing SQLite databases created before the latest model schema."""
+    if not str(bind.url).startswith("sqlite"):
+        return
+        
     inspector = inspect(bind)
     table_columns = {
         "rover_devices": {

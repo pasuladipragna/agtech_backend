@@ -1,7 +1,10 @@
-import httpx, time, sys
+import httpx, os, time, sys
 from datetime import datetime
 
-BASE = "http://localhost:8000/api/v1"
+BASE_URL = os.getenv("E2E_BASE_URL", "http://localhost:8000").rstrip("/")
+BASE = BASE_URL + "/api/v1"
+ADMIN_EMAIL = os.getenv("E2E_ADMIN_EMAIL", "admin@agritech.com")
+ADMIN_PASSWORD = os.getenv("E2E_ADMIN_PASSWORD", "admin123")
 RESULTS = []
 
 def log(status, section, test, detail="", code=None):
@@ -41,15 +44,14 @@ print("=" * 65)
 
 # 0. HEALTH
 print("\n-- 0. Health Check")
-r = req("GET", "http://localhost:8000/health")
+r = req("GET", BASE_URL + "/health")
 log("PASS" if r and r.status_code==200 else "FAIL", "Health", "GET /health", getattr(r,"text",""), getattr(r,"status_code",None))
 if not r or r.status_code != 200: sys.exit(1)
-r = req("GET", "http://localhost:8000/")
+r = req("GET", BASE_URL + "/")
 log("PASS" if r and r.status_code==200 else "FAIL", "Health", "GET / root", "", getattr(r,"status_code",None))
-
 # 1. AUTH
 print("\n-- 1. Authentication")
-r = req("POST", "/auth/login", {"email": "admin@agritech.com", "password": "Admin@123456"})
+r = req("POST", "/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
 if r and r.status_code == 200:
     d = r.json(); admin_token = d.get("access_token")
     log("PASS", "Auth", "Admin login", "role=" + d["user"]["role"], 200)
@@ -79,10 +81,8 @@ else:
 
 r = req("POST", "/registration/submit", fd, form=True)
 log("PASS" if r and r.status_code==409 else "FAIL", "Registration", "Duplicate -> 409", "", getattr(r,"status_code",None))
-
 r = req("GET", "/registration/status", params={"email": TEST_EMAIL})
 log("PASS" if r and r.status_code==200 else "FAIL", "Registration", "GET /registration/status", "", getattr(r,"status_code",None))
-
 r = req("GET", "/registration/status", params={"email": "nope@x.com"})
 log("PASS" if r and r.status_code==404 else "FAIL", "Registration", "Unknown email -> 404", "", getattr(r,"status_code",None))
 
@@ -232,7 +232,7 @@ log("PASS" if r and r.status_code==200 else "FAIL", "Products", "GET /products",
 r = req("POST", "/admin/products", {"name": "E2E Pesticide " + TS, "product_type": "Pesticide", "target_crop": "Wheat"}, token=admin_token)
 log("PASS" if r and r.status_code==201 else "FAIL", "Products", "POST /products", getattr(r,"text",""), getattr(r,"status_code",None))
 if farmer_token:
-    r = req("POST", "/products", {"name": "Hack", "product_type": "Pesticide"}, token=farmer_token)
+    r = req("POST", "/admin/products", {"name": "Hack", "product_type": "Pesticide"}, token=farmer_token)
     log("PASS" if r and r.status_code in (401,403) else "WARN", "Products", "Farmer POST product -> 403", "", getattr(r,"status_code",None))
 
 # 11. NOTIFICATIONS
@@ -276,7 +276,7 @@ if ticket_id:
     r = req("POST", "/support/tickets/" + ticket_id + "/messages", {"message": "E2E reply"}, token=tok)
     log("PASS" if r and r.status_code in (200,201) else "WARN", "Support", "POST ticket message", getattr(r,"text",""), getattr(r,"status_code",None))
     if admin_token:
-        r = req("PATCH", "/support/tickets/" + ticket_id + "/status", {"status": "IN_PROGRESS"}, token=admin_token)
+        r = req("PATCH", "/admin/support/tickets/" + ticket_id + "/status", {"status": "IN_PROGRESS"}, token=admin_token)
         log("PASS" if r and r.status_code==200 else "WARN", "Support", "Admin PATCH ticket status", "", getattr(r,"status_code",None))
 
 # 14. DASHBOARD
@@ -296,8 +296,8 @@ log("PASS" if r and r.status_code==200 else "WARN", "Reports", "GET /reports adm
 
 # 16. SPRAY
 print("\n-- 16. Spray Sessions")
-r = req("GET", "/spray-sessions", token=admin_token)
-log("PASS" if r and r.status_code==200 else "WARN", "Spray", "GET /spray-sessions", "count=" + str(len(r.json()) if r and r.status_code==200 else "?"), getattr(r,"status_code",None))
+r = req("GET", "/spraying/sessions", token=admin_token)
+log("PASS" if r and r.status_code==200 else "WARN", "Spray", "GET /spraying/sessions", "count=" + str(len(r.json()) if r and r.status_code==200 else "?"), getattr(r,"status_code",None))
 
 # 17. ACTIVITY LOGS
 print("\n-- 17. Activity Logs")
@@ -306,9 +306,9 @@ log("PASS" if r and r.status_code==200 else "WARN", "Admin", "GET /admin/activit
 
 # 18. DOCS
 print("\n-- 18. API Docs")
-r = req("GET", "http://localhost:8000/docs")
+r = req("GET", BASE_URL + "/docs")
 log("PASS" if r and r.status_code==200 else "WARN", "Docs", "GET /docs Swagger UI", "", getattr(r,"status_code",None))
-r = req("GET", "http://localhost:8000/openapi.json")
+r = req("GET", BASE_URL + "/openapi.json")
 if r and r.status_code==200:
     log("PASS", "Docs", "GET /openapi.json", "total_routes=" + str(len(r.json().get("paths", {}))), 200)
 else:
@@ -355,10 +355,16 @@ if field_id:
 
 # 20. CLEANUP
 print("\n-- 20. Cleanup")
-if field_id:
+if farm_id:
     tok = farmer_token or admin_token
-    r = req("DELETE", "/fields/" + field_id, token=tok)
-    log("PASS" if r and r.status_code in (200,204) else "WARN", "Cleanup", "DELETE /fields/:id", "", getattr(r,"status_code",None))
+    cleanup_field = req("POST", "/fields", {"farm_id": farm_id, "name": "E2E Cleanup Field " + TS}, token=tok)
+    cleanup_field_id = cleanup_field.json().get("id") if cleanup_field and cleanup_field.status_code == 201 else None
+    if cleanup_field_id:
+        log("PASS", "Cleanup", "Create empty cleanup field", "id=" + cleanup_field_id, 201)
+        r = req("DELETE", "/fields/" + cleanup_field_id, token=tok)
+        log("PASS" if r and r.status_code in (200,204) else "WARN", "Cleanup", "DELETE empty field", "", getattr(r,"status_code",None))
+    else:
+        log("WARN", "Cleanup", "Create empty cleanup field", getattr(cleanup_field,"text",""), getattr(cleanup_field,"status_code",None))
 
 total = len(RESULTS)
 passed = sum(1 for x in RESULTS if x["s"] == "PASS")
@@ -384,3 +390,5 @@ if warned > 0:
             print("  WARN [" + x["sec"] + "] " + x["t"])
             if x["d"]: print("       -> " + x["d"])
 print("=" * 65)
+if failed:
+    sys.exit(1)
