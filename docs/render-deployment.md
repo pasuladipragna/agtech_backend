@@ -6,11 +6,11 @@ The backend and frontend are separate repositories, so deploy them as separate R
 
 1. Push the backend repository, including `render.yaml`, to GitHub.
 2. In Render, choose **New +** then **Blueprint**, select the backend repository, and sync the blueprint.
-3. The blueprint creates the `agtech-backend` web service and a managed PostgreSQL database. The web service uses a generated `SECRET_KEY`, the database's internal connection string, and the frontend's default Render origin in `CORS_ORIGINS`.
+3. The blueprint creates the `agtech-backend` web service. Set its private `DATABASE_URL` environment variable to the Supabase **Session Pooler** connection string (IPv4-compatible), replacing the password placeholder with the database password. Avoid the direct `db.<project-ref>.supabase.co:5432` endpoint when it resolves to IPv6, which may be unreachable from Render. The service uses a generated `SECRET_KEY` and the frontend's default Render origin in `CORS_ORIGINS`.
 4. Wait for the service health check at `/health` to pass. The API docs will be at `https://agtech-backend.onrender.com/docs`.
 5. Create the first administrator from the service's Shell with `python create_admin.py`. Choose a strong password that meets the script's requirements; do not use demo credentials.
 
-The blueprint uses paid Starter service/database plans for a persistent production deployment. Review Render's current pricing before syncing it. If you change the service hostname or use a custom domain, update the backend `CORS_ORIGINS` value to a JSON array containing the exact frontend origin, for example `["https://app.example.com"]`.
+The blueprint uses a paid Starter web-service plan. Review Render's current pricing before syncing it. If you change the service hostname or use a custom domain, update the backend `CORS_ORIGINS` value to a JSON array containing the exact frontend origin, for example `["https://app.example.com"]`.
 
 ## Frontend
 
