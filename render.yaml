@@ -18,7 +18,7 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: CORS_ORIGINS
-        value: '["https://agtech-frontend.onrender.com"]'
+        value: '["https://agtech-frontend-3p3n.onrender.com"]'
       - key: USE_MOCK_AI_PROVIDER
         value: "true"
 
