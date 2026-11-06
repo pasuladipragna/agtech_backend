@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from typing import List
@@ -20,10 +21,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
     
     # CORS
-    CORS_ORIGINS: List[str] = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
     
     # Database
     DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://agri_user:agri_password_2026@localhost:5432/smart_agritech")
@@ -65,6 +63,30 @@ class Settings(BaseSettings):
 
     class Config:
         case_sensitive = True
+
+    @property
+    def cors_origins(self) -> List[str]:
+        raw_origins = self.CORS_ORIGINS.strip()
+        if not raw_origins:
+            return []
+
+        if raw_origins.startswith("["):
+            try:
+                parsed_origins = json.loads(raw_origins)
+                if isinstance(parsed_origins, list):
+                    return [
+                        origin.strip().rstrip("/")
+                        for origin in parsed_origins
+                        if isinstance(origin, str) and origin.strip()
+                    ]
+            except json.JSONDecodeError:
+                pass
+
+        return [
+            origin.strip().rstrip("/")
+            for origin in raw_origins.split(",")
+            if origin.strip()
+        ]
 
 settings = Settings()
 
